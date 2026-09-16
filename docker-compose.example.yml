@@ -1,0 +1,62 @@
+# govee-mqtt-bridge — example deployment
+#
+# Copy this to docker-compose.yml and .env.example to .env, fill in .env,
+# then `docker compose up -d --build`.
+#
+# The image is built locally; nothing is published to a registry. The build
+# vendors the shared HA-discovery/MQTT toolkit from ./_shared — see
+# ARCHITECTURE.md. Requires Docker Compose v2.17+ (for `additional_contexts`).
+services:
+  govee-mqtt-bridge:
+    build:
+      context: .
+      additional_contexts:
+        ha_mqtt_bridge: ./_shared/ha-mqtt-bridge-toolkit
+        python_github_error_reporter: ./_shared/python-github-error-reporter
+    image: govee-mqtt-bridge:local
+    container_name: govee-mqtt-bridge
+    hostname: govee-mqtt-bridge
+    restart: unless-stopped
+    stop_grace_period: 10s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    environment:
+      GOVEE_EMAIL: ${GOVEE_EMAIL}
+      GOVEE_PASSWORD: ${GOVEE_PASSWORD}
+      GOVEE_CLIENT_ID: ${GOVEE_CLIENT_ID}
+      MQTT_HOST: ${MQTT_HOST:-mqtt.example.com}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      POLL_INTERVAL: ${POLL_INTERVAL:-30}
+      LEAK_HOLD_SECONDS: ${LEAK_HOLD_SECONDS:-600}
+      HA_DISCOVERY_PREFIX: ${HA_DISCOVERY_PREFIX:-homeassistant}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-govee/leak}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Optional production-error reporting — off unless both are set.
+      GITHUB_ERROR_TOKEN: ${GITHUB_ERROR_TOKEN:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
+      GITHUB_ERROR_ENVIRONMENT: ${GITHUB_ERROR_ENVIRONMENT:-production}
+    # ThreadedPublisher (toolkit) touches /tmp/healthy after every successful
+    # MQTT publish. The bridge publishes state every poll cycle (~30s), so a
+    # fresh mtime within 600s means the daemon is alive, connected, and
+    # making forward progress on the Govee API.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mtime=$$(stat -c %Y /tmp/healthy 2>/dev/null) && [ "$$(( $$(date +%s) - mtime ))" -lt 600 ]'
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    volumes:
+      # Application code bind-mounted (not baked into the image) so a code
+      # change needs only a restart, not a rebuild. Read-only.
+      - ./app:/app:ro
