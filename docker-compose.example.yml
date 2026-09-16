@@ -3,7 +3,8 @@
 # Copy this to docker-compose.yml and .env.example to .env, fill in .env,
 # then `docker compose up -d --build`.
 #
-# The image is built locally; nothing is published to a registry. The build
+# The image is published as ghcr.io/geoffmyers/govee-mqtt-bridge (`docker compose pull`),
+# or build it here (`docker compose build`). The build
 # vendors the shared HA-discovery/MQTT toolkit from ./_shared — see
 # ARCHITECTURE.md. Requires Docker Compose v2.17+ (for `additional_contexts`).
 services:
@@ -13,7 +14,7 @@ services:
       additional_contexts:
         ha_mqtt_bridge: ./_shared/ha-mqtt-bridge-toolkit
         python_github_error_reporter: ./_shared/python-github-error-reporter
-    image: govee-mqtt-bridge:local
+    image: ghcr.io/geoffmyers/govee-mqtt-bridge:latest
     container_name: govee-mqtt-bridge
     hostname: govee-mqtt-bridge
     restart: unless-stopped
