@@ -18,8 +18,7 @@ after detection, then auto-cleared.
 
 MQTT client / LWT / publish flavors, HA discovery payload assembly,
 device-block construction, and ISO-8601 timestamp formatting all go
-through the shared `ha_mqtt_bridge` toolkit
-(`infrastructure/_shared/ha-mqtt-bridge-toolkit/`).
+through the shared `ha_mqtt_bridge` toolkit (`ha-mqtt-bridge-toolkit`).
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ from ha_mqtt_bridge import (
     epoch_ms_to_iso,
     now_ms,
     register_github_error_reporter,
+    watch_ha_birth,
 )
 
 
@@ -66,6 +66,11 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ["MQTT_PASSWORD"]
+# Off by default (current behaviour) — set MQTT_TLS=1 for a broker that
+# requires TLS; MQTT_CA_FILE points at a custom CA bundle (system trust
+# store is used when unset).
+MQTT_TLS = os.environ.get("MQTT_TLS", "0") != "0"
+MQTT_CA_FILE = os.environ.get("MQTT_CA_FILE") or None
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 LEAK_HOLD_SECONDS = int(os.environ.get("LEAK_HOLD_SECONDS", "600"))
 DISCOVERY_PREFIX = os.environ.get("HA_DISCOVERY_PREFIX", "homeassistant")
@@ -181,48 +186,68 @@ def fetch_warn_messages(token: str, device: str, limit: int = 20) -> list[dict]:
     return payload.get("data") or []
 
 
-def parse_sensors(devices_response: dict) -> list[Sensor]:
+def _parse_one_sensor(d: dict) -> Sensor:
+    ext = d.get("deviceExt", {}) or {}
+    ds = json.loads(ext.get("deviceSettings") or "{}")
+    ldd = json.loads(ext.get("lastDeviceData") or "{}")
+    try:
+        slot: int | None = int(ds.get("header")) if ds.get("header") not in (None, "") else None
+    except (TypeError, ValueError):
+        slot = None
+    return Sensor(
+        device=d["device"],
+        name=d.get("deviceName") or d["device"],
+        battery=ds.get("battery"),
+        online=bool(ldd.get("online")),
+        gwonline=bool(ldd.get("gwonline")),
+        last_time=int(ldd.get("lastTime") or 0),
+        firmware=str(d.get("versionSoft") or ds.get("versionSoft") or ""),
+        slot=slot,
+    )
+
+
+def parse_sensors(devices_response: dict, log=None) -> list[Sensor]:
     out: list[Sensor] = []
     for d in devices_response.get("data", {}).get("devices", []):
         if d.get("sku") != "H5054":
             continue
-        ext = d.get("deviceExt", {}) or {}
-        ds = json.loads(ext.get("deviceSettings") or "{}")
-        ldd = json.loads(ext.get("lastDeviceData") or "{}")
+        # One malformed device (bad JSON in deviceSettings/lastDeviceData, a
+        # missing "device" key) must not drop every OTHER sensor's reading
+        # for the whole poll cycle — isolate the parse per device.
         try:
-            slot: int | None = int(ds.get("header")) if ds.get("header") not in (None, "") else None
-        except (TypeError, ValueError):
-            slot = None
-        out.append(
-            Sensor(
-                device=d["device"],
-                name=d.get("deviceName") or d["device"],
-                battery=ds.get("battery"),
-                online=bool(ldd.get("online")),
-                gwonline=bool(ldd.get("gwonline")),
-                last_time=int(ldd.get("lastTime") or 0),
-                firmware=str(d.get("versionSoft") or ds.get("versionSoft") or ""),
-                slot=slot,
-            )
-        )
+            out.append(_parse_one_sensor(d))
+        except Exception as e:
+            if log is not None:
+                log.warning("skipping malformed H5054 device %r: %s", d.get("device", "?"), e)
     return out
 
 
-def parse_gateway(gateways_response: dict) -> Gateway | None:
+def _parse_one_gateway(g: dict) -> Gateway:
+    ext = g.get("deviceExt", {}) or {}
+    ds = json.loads(ext.get("deviceSettings") or "{}")
+    ldd = json.loads(ext.get("lastDeviceData") or "{}")
+    return Gateway(
+        device=g["device"],
+        name=g.get("deviceName") or "Govee Water Sensor Gateway",
+        online=bool(ldd.get("online")),
+        last_heartbeat=int(ldd.get("lastTime") or 0),
+        firmware=str(g.get("versionSoft") or ds.get("versionSoft") or ""),
+        mac=str(ds.get("mac") or ""),
+    )
+
+
+def parse_gateway(gateways_response: dict, log=None) -> Gateway | None:
+    # Only one gateway is ever published (the first H5040 found), but a
+    # malformed entry still shouldn't raise past a well-formed one earlier
+    # or later in the list — try each in order, keep the first that parses.
     for g in gateways_response.get("data", {}).get("gateways", []):
         if g.get("sku") != "H5040":
             continue
-        ext = g.get("deviceExt", {}) or {}
-        ds = json.loads(ext.get("deviceSettings") or "{}")
-        ldd = json.loads(ext.get("lastDeviceData") or "{}")
-        return Gateway(
-            device=g["device"],
-            name=g.get("deviceName") or "Govee Water Sensor Gateway",
-            online=bool(ldd.get("online")),
-            last_heartbeat=int(ldd.get("lastTime") or 0),
-            firmware=str(g.get("versionSoft") or ds.get("versionSoft") or ""),
-            mac=str(ds.get("mac") or ""),
-        )
+        try:
+            return _parse_one_gateway(g)
+        except Exception as e:
+            if log is not None:
+                log.warning("skipping malformed H5040 gateway %r: %s", g.get("device", "?"), e)
     return None
 
 
@@ -434,12 +459,90 @@ def publish_history(pub: ThreadedPublisher, device: str, alerts: list[dict]) -> 
         cleaned.append({
             "time": epoch_ms_to_iso(t_ms),
             "time_ms": t_ms,
-            "message": (a.get("message") or "").replace(" ", " "),
+            "message": (a.get("message") or "").replace("\u00a0", " "),
             "read": bool(a.get("read")),
         })
     cleaned.sort(key=lambda x: x["time_ms"], reverse=True)
     payload = {"history": cleaned, "count": len(cleaned)}
     pub.publish_attributes(f"{TOPIC_PREFIX}/{device}/leak/attrs", payload)
+
+
+def _baseline_topic(device: str) -> str:
+    # Internal bookkeeping topic, not part of HA discovery — retained so
+    # the bridge can read its own last-known `lastTime` back on restart.
+    return f"{TOPIC_PREFIX}/{device}/_leak_baseline_ms"
+
+
+def seed_baseline_from_retained(
+    pub: ThreadedPublisher,
+    sensors: list[Sensor],
+    log,
+    wait_s: float = 2.5,
+) -> dict[str, int]:
+    """Return the starting `baseline_last_time` map, preferring each
+    sensor's own persisted (retained MQTT) `lastTime` over its freshly
+    fetched current value.
+
+    Without this, every bridge restart re-baselines against whatever
+    `lastTime` the Govee API reports RIGHT NOW — which already reflects
+    any leak that happened while the bridge was down, so that leak can
+    never register as "new" (baseline == current, not strictly less).
+    A leak during downtime was silently absorbed into the post-restart
+    baseline. Reading back the last value THIS bridge itself observed
+    (persisted as a retained topic — this stack has no data volume, same
+    approach the Emporia Vue bridge's `seed_energy_from_retained` uses)
+    closes that gap: if Govee's API now reports a `lastTime` newer than
+    what we last saw before going down, the normal "current > baseline"
+    detection in the main loop fires immediately on the first post-
+    restart poll.
+
+    Still not perfect — see README's Limitations section: this is a
+    single-value watermark, not a timeline, so it can't distinguish one
+    leak from several that occurred during the same downtime window
+    (the `history` attribute, refreshed whenever a leak IS detected,
+    covers that up to its own limit of 20 alerts). And on a first-ever
+    run (nothing retained yet), or if the broker has no persistence and
+    lost its retained state, there's nothing to seed from — this
+    function falls back to each sensor's current `lastTime`, i.e.
+    today's baseline behavior, which is a real remaining edge case.
+    """
+    baseline: dict[str, int] = {s.device: s.last_time for s in sensors}
+    if not sensors:
+        return baseline
+
+    by_topic = {_baseline_topic(s.device): s.device for s in sensors}
+
+    def _on_retained(topic: str, payload: bytes) -> None:
+        device = by_topic.get(topic)
+        if device is None:
+            return
+        try:
+            persisted = int(payload.decode())
+        except (ValueError, UnicodeDecodeError):
+            log.warning("bad retained leak baseline payload on %s: %r", topic, payload)
+            return
+        # Never move the baseline BACKWARD relative to the value we just
+        # fetched from the API — only forward-fill from a lower fresh
+        # value up to a higher persisted one (the case this exists for).
+        if persisted > baseline.get(device, 0):
+            baseline[device] = persisted
+
+    for topic in by_topic:
+        pub.subscribe(topic, _on_retained)
+    if not pub.wait_until_connected(timeout=10.0):
+        log.warning("MQTT not connected after 10s; leak baseline may start from current API state only")
+    time.sleep(wait_s)
+    noop = lambda _topic, _payload: None  # noqa: E731
+    for topic in by_topic:
+        pub.subscribe(topic, noop)
+    return baseline
+
+
+def publish_baseline(pub: ThreadedPublisher, baseline_last_time: dict[str, int]) -> None:
+    """Persist the current baseline as a retained topic per sensor, so
+    the NEXT restart can read it back via `seed_baseline_from_retained`."""
+    for device, last_time in baseline_last_time.items():
+        pub.publish_raw(_baseline_topic(device), str(last_time), retain=True)
 
 
 def main() -> int:
@@ -458,12 +561,15 @@ def main() -> int:
         lwt_topic=BRIDGE_LWT_TOPIC,
         discovery_prefix=DISCOVERY_PREFIX,
         health_path="/tmp/healthy",
+        tls=MQTT_TLS,
+        ca_file=MQTT_CA_FILE,
     )
     pub.start()
 
     baseline_last_time: dict[str, int] = {}
     leak_until: dict[str, int] = {}
     discovery_published = False
+    backfill_done = False
 
     stopping = False
 
@@ -475,6 +581,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    def _on_ha_birth() -> None:
+        # Retained discovery configs usually survive an HA restart, but
+        # not always (a broker restart with no persistence, a manual
+        # "purge retained messages") — re-publishing on HA's birth
+        # message closes that gap without a bridge restart.
+        nonlocal discovery_published
+        log.info("HA birth message received; re-publishing discovery")
+        discovery_published = False
+
+    watch_ha_birth(pub, _on_ha_birth, discovery_prefix=DISCOVERY_PREFIX)
+
     while not stopping:
         try:
             # Refresh token a minute before expiry.
@@ -484,8 +601,8 @@ def main() -> int:
 
             devices = fetch_devices(token)
             gateways = fetch_gateways(token)
-            sensors = parse_sensors(devices)
-            gateway = parse_gateway(gateways)
+            sensors = parse_sensors(devices, log)
+            gateway = parse_gateway(gateways, log)
 
             if not discovery_published:
                 if not sensors:
@@ -496,8 +613,6 @@ def main() -> int:
                         unique_id=unique_id,
                         payload=payload,
                     )
-                for s in sensors:
-                    baseline_last_time[s.device] = s.last_time
                 # The ThreadedPublisher's LWT machinery publishes "online" on
                 # connect automatically; no manual publish needed here.
                 discovery_published = True
@@ -506,6 +621,18 @@ def main() -> int:
                     len(sensors),
                     gateway.device if gateway else "none",
                 )
+
+            if not backfill_done:
+                # Prefer each sensor's persisted (retained-MQTT) lastTime
+                # over its freshly fetched current value, so a leak that
+                # happened while the bridge was down still registers as
+                # "new" on this first post-restart poll — see
+                # `seed_baseline_from_retained`. Independent of
+                # discovery_published so an HA-birth re-publish of
+                # discovery doesn't also re-seed the baseline or re-run
+                # the history backfill below.
+                baseline_last_time = seed_baseline_from_retained(pub, sensors, log)
+                publish_baseline(pub, baseline_last_time)
                 # Initial history backfill — one warnMessage call per sensor.
                 # Subsequent refreshes happen only on new-leak detection below.
                 for s in sensors:
@@ -514,12 +641,17 @@ def main() -> int:
                         publish_history(pub, s.device, alerts)
                     except Exception as e:
                         log.warning("history backfill failed for %s: %s", s.device, e)
+                backfill_done = True
 
             for s in sensors:
                 if s.last_time > baseline_last_time.get(s.device, 0):
                     log.warning("LEAK %s (%s) lastTime=%d", s.name, s.device, s.last_time)
                     leak_until[s.device] = now_ms() + LEAK_HOLD_SECONDS * 1000
                     baseline_last_time[s.device] = s.last_time
+                    # Persist immediately (not just at startup) so the
+                    # retained baseline this sensor reads back on its
+                    # NEXT restart reflects this leak, not a stale one.
+                    pub.publish_raw(_baseline_topic(s.device), str(s.last_time), retain=True)
                     # Refresh just this sensor's history so the new alert appears
                     # in HA's attribute list.
                     try:

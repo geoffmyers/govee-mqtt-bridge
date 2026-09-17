@@ -36,11 +36,15 @@ services:
       MQTT_PORT: ${MQTT_PORT:-1883}
       MQTT_USER: ${MQTT_USER:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TLS: ${MQTT_TLS:-0}
+      MQTT_CA_FILE: ${MQTT_CA_FILE:-}
       POLL_INTERVAL: ${POLL_INTERVAL:-30}
       LEAK_HOLD_SECONDS: ${LEAK_HOLD_SECONDS:-600}
       HA_DISCOVERY_PREFIX: ${HA_DISCOVERY_PREFIX:-homeassistant}
       MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-govee/leak}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      GOVEE_APP_VERSION: ${GOVEE_APP_VERSION:-7.4.21}
+      GOVEE_USER_AGENT: ${GOVEE_USER_AGENT:-GoveeHome/7.4.21 (com.ihoment.GoVeeSensor; build:7.4.21; iOS 26.5.0) Alamofire/4.0.0}
       # Optional production-error reporting — off unless both are set.
       GITHUB_ERROR_TOKEN: ${GITHUB_ERROR_TOKEN:-}
       GITHUB_REPO: ${GITHUB_REPO:-}

@@ -123,8 +123,26 @@ next poll; the entity `unique_id` is keyed on the device ID, not the name, so
 history is preserved. Pairing a new sensor in the Govee app makes it appear
 in Home Assistant on the next poll cycle with no bridge restart needed.
 
+Leak detection compares each poll's `lastTime` against a per-sensor
+baseline. The bridge persists that baseline as a retained MQTT topic (this
+stack has no data volume) and reads it back on startup, so **a leak that
+occurs while the bridge itself is down is still detected** on the first
+poll after it comes back — the baseline is the last value the bridge
+itself saw, not whatever Govee's API happens to report right now.
+Two edge cases remain, both inherent to tracking a single watermark rather
+than a full timeline: a first-ever run (nothing persisted yet) falls back
+to today's current API state as the starting baseline, so any leak already
+reflected in that very first poll is absorbed rather than flagged; and if
+the MQTT broker itself loses its retained messages during the same window
+the bridge is down (no persistence enabled, a manual "purge retained"),
+there's nothing to read back either. The `history` attribute (last 20
+alerts, refreshed whenever a leak IS detected) is the fuller record if you
+need to audit what Govee itself logged.
+
 If Govee changes an endpoint's shape, expect log errors and entities going
-`unavailable` rather than a crash.
+`unavailable` rather than a crash. A malformed entry for one sensor or
+gateway is skipped (and logged) rather than dropping every other device's
+reading for that poll cycle.
 
 ## Configuration
 
@@ -139,6 +157,8 @@ Environment variables, set in `.env` (`.env.example` lists them all):
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | *(empty)* | MQTT username |
 | `MQTT_PASSWORD` | *(required)* | MQTT password |
+| `MQTT_TLS` | `0` | Set to `1` for a broker that requires TLS |
+| `MQTT_CA_FILE` | *(unset)* | Path to a custom CA bundle; leave unset to use the system trust store (only consulted when `MQTT_TLS=1`) |
 | `POLL_INTERVAL` | `30` | Seconds between polls |
 | `GOVEE_APP_VERSION` | `7.4.21` | App version sent to Govee's API; raise it if Govee starts rejecting an old one |
 | `GOVEE_USER_AGENT` | the Govee Home iOS app's | User-Agent sent to Govee's API |
